@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mx.compile` and queues frames ahead with `mx.async_eval`. The audio is the
   same, sample for sample; a frame takes about 26 ms instead of 36 on
   `mrt2_base` at 8 bits on Apple Silicon. `compile=False` (or the `compile`
-  attribute) restores the uncompiled loop. Warm-up traces the compiled step.
+  attribute) restores the uncompiled loop. Warm-up runs uncompiled steps
+  first, then traces the compiled step.
 - MLX `generate` evaluates every array in the carried state each frame, not
   only the output. Unevaluated state arrays chained each step's graph to the
   last (about 120 B per frame), until Metal's buffer limit ended a long stream

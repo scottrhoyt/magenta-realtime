@@ -18,10 +18,11 @@ With `compile` (the default), `generate` runs each frame's sampler step under
 `mx.compile` and queues frames ahead. These tests check that it gives the same
 audio as the uncompiled loop, sample for sample, through changes of
 conditioning, temperature and top-k between chunks; that those changes replay
-the trace made in warm-up instead of tracing again; and that a state of the
-wrong structure is refused.
+the trace made in warm-up instead of tracing again; that it is faster; and
+that a state of the wrong structure is refused.
 """
 
+import time
 import unittest
 
 import numpy as np
@@ -131,6 +132,29 @@ class TestCompiledGenerate(unittest.TestCase):
       del sampler.step_with_emits
     self.assertEqual(replayed, 0)
     self.assertTrue(calls, 'a new compiled step traced without being counted')
+
+  def test_compiled_is_faster(self):
+    """A step traced over lazy arrays (the weights after loading, or arrays a
+    module builds on its first call) replays their computation every frame:
+    with warm-up tracing first, mrt2_base at 8 bits took 135 ms per frame
+    compiled against 37 uncompiled, with the same audio. Warm-up runs
+    uncompiled first, and compiled is then about a third faster."""
+    cond = {MUSICCOCA.key: self.style_a}
+
+    def median_ms(compile_):
+      self.mrt.compile = compile_
+      _, state = self.mrt.generate(conditioning=cond, frames=2)
+      times = []
+      for _ in range(20):
+        t0 = time.perf_counter()
+        _, state = self.mrt.generate(conditioning=cond, frames=2, state=state)
+        times.append((time.perf_counter() - t0) * 1000 / 2)
+      return float(np.median(times))
+
+    uncompiled = median_ms(False)
+    compiled = median_ms(True)
+    print(f'compiled {compiled:.1f} ms/frame, uncompiled {uncompiled:.1f}')
+    self.assertLess(compiled, uncompiled)
 
   def test_state_round_trips_through_flatten(self):
     _, state = self.mrt.generate(frames=1)

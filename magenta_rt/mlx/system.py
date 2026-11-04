@@ -291,9 +291,20 @@ class MagentaRT2System:
       conditioning[cfg.key] = [-1] * cfg.rvq_truncation_level
 
     block, constants = self._build_conditioning(conditioning)
-    # Through the same frame loop as `generate`: with `compile`, this traces
-    # the compiled step, so the first `generate` replays it.
-    self._run_frames(block, constants, self._initial_state(), steps)
+    # Uncompiled first. Loading, bf16 conversion and quantization leave the
+    # weights lazy, and some modules build arrays on their first call; an
+    # uncompiled step evaluates them all in place. A step traced before that
+    # captures the graphs that compute them and replays them on every frame:
+    # 135 ms per frame instead of 26 on mrt2_base at 8 bits.
+    compile_, self.compile = self.compile, False
+    try:
+      self._run_frames(block, constants, self._initial_state(), steps)
+    finally:
+      self.compile = compile_
+    # Then, with `compile`, trace the compiled step, so the first `generate`
+    # replays it.
+    if self.compile:
+      self._run_frames(block, constants, self._initial_state(), steps)
 
     logger.info('Warm-up done (%.1fs).', time.time() - t0)
 
