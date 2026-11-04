@@ -25,86 +25,14 @@ from sequence_layers.mlx import export
 from . import model, system
 from . import spectrostream
 from .load_weights import load_weights, convert_to_bf16
+from .state import flatten_state as _flatten_state
+from .state import unflatten_state as _unflatten_state
 from magenta_rt import paths
 from magenta_rt.config import (
     DRUM_PIANOROLL,
     MUSICCOCA,
     PIANOROLL_WITH_ONSETS
 )
-
-
-def _flatten_state(state):
-  """Flatten a nested pytree state into a list of mx.array.
-
-  Handles tuples, lists, and mx.array leaves. Empty tuples contribute
-  zero arrays.
-
-  Args:
-    state: Nested tuple/list of mx.array.
-
-  Returns:
-    (flat_arrays, structure) where structure encodes the nesting.
-  """
-  flat = []
-
-  def _record(node):
-    if isinstance(node, mx.array):
-      flat.append(node)
-      return 'array'
-    elif isinstance(node, tuple):
-      children = [_record(child) for child in node]
-      return ('tuple', children)
-    elif isinstance(node, list):
-      children = [_record(child) for child in node]
-      return ('list', children)
-    elif isinstance(node, dict):
-      # We shouldn't hit dicts, if we do we need to handle keys properly.
-      raise TypeError(f'Unsupported state node type: {type(node)}')
-    elif isinstance(node, sl.MaskedSequence):
-      children = [_record(child) for child in [node.values, node.mask]]
-      return ('MaskedSequence', children)
-    elif isinstance(node, sl.Sequence):
-      children = [_record(child) for child in [node.values, node.mask]]
-      return ('Sequence', children)
-    else:
-      raise TypeError(f'Unsupported state node type: {type(node)}')
-
-  structure = _record(state)
-  return flat, structure
-
-
-def _unflatten_state(flat, structure):
-  """Reconstruct a nested state from a flat array list and structure.
-
-  Args:
-    flat: List of mx.array.
-    structure: Structure descriptor from _flatten_state.
-
-  Returns:
-    Nested tuple/list matching the original structure.
-  """
-  idx = [0]
-
-  def _rebuild(struct):
-    if struct == 'array':
-      result = flat[idx[0]]
-      idx[0] += 1
-      return result
-    elif isinstance(struct, tuple) and struct[0] == 'tuple':
-      return tuple(_rebuild(s) for s in struct[1])
-    elif isinstance(struct, tuple) and struct[0] == 'list':
-      return [_rebuild(s) for s in struct[1]]
-    elif struct[0] == 'MaskedSequence':
-       return sl.MaskedSequence(_rebuild(struct[1][0]), _rebuild(struct[1][1]))
-    elif struct[0] == 'Sequence':
-       return sl.Sequence(_rebuild(struct[1][0]), _rebuild(struct[1][1]))
-    else:
-      raise ValueError(f'Unknown structure node: {struct}')
-
-  result = _rebuild(structure)
-  if idx[0] != len(flat):
-    raise ValueError(f'Not all arrays consumed: used {idx[0]} of {len(flat)}')
-  return result
 
 
 def _discretize_cfg_token(value, step, max_bin, offset):
