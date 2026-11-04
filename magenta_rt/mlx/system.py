@@ -28,6 +28,7 @@ from . import depthformer
 from . import spectrostream
 from . import model as model_configs
 from .load_weights import load_weights
+from .state import flatten_state, unflatten_state
 from .. import audio
 from .. import musiccoca
 from .. import paths
@@ -190,6 +191,7 @@ class MagentaRT2System:
       cfg_scales: dict[str, float] | None = None,
       bits: int | None = 8,
       quantize_group_size: int | None = None,
+      compile: bool = True,
   ):
     """Initialise the system: build model, load weights, optionally quantize.
 
@@ -207,6 +209,11 @@ class MagentaRT2System:
       bits: Quantization bit width (4 or 8). None means no quantization.
       quantize_group_size: Group size for quantization. If None, defaults to
           32 for 4-bit and 64 for 8-bit.
+      compile: Run each frame's sampler step under ``mx.compile`` and queue
+          frames ahead (see ``generate``). The audio is the same, sample for
+          sample; a frame is faster because its graph is traced once instead
+          of rebuilt in Python every frame. Can be changed after construction
+          through the ``compile`` attribute.
     """
 
     self._model = model_configs.get_model_class(size)()
@@ -264,6 +271,13 @@ class MagentaRT2System:
       x.rvq_truncation_level for x in self._model.input_configs
     )
 
+    # --- Compiled frame step ---
+    self.compile = compile
+    # One compiled step per set of constants' keys. A new shape or dtype of
+    # an input traces again inside the compiled function.
+    self._compiled_steps = {}
+    _, self._state_structure = flatten_state(self._initial_state())
+
     # --- Warm up ---
     self._warmup()
 
@@ -277,20 +291,109 @@ class MagentaRT2System:
       conditioning[cfg.key] = [-1] * cfg.rvq_truncation_level
 
     block, constants = self._build_conditioning(conditioning)
+    # Uncompiled first. Loading, bf16 conversion and quantization leave the
+    # weights lazy, and some modules build arrays on their first call; an
+    # uncompiled step evaluates them all in place. A step traced before that
+    # captures the graphs that compute them and replays them on every frame:
+    # 135 ms per frame instead of 26 on mrt2_base at 8 bits.
+    compile_, self.compile = self.compile, False
+    try:
+      self._run_frames(block, constants, self._initial_state(), steps)
+    finally:
+      self.compile = compile_
+    # Then, with `compile`, trace the compiled step, so the first `generate`
+    # replays it.
+    if self.compile:
+      self._run_frames(block, constants, self._initial_state(), steps)
 
+    logger.info('Warm-up done (%.1fs).', time.time() - t0)
+
+  def _initial_state(self):
+    """A fresh streaming state."""
     input_spec = sl.ChannelSpec(
         shape=(self._num_channels,), dtype=mx.int32,
     )
-    state = self._sampler.get_initial_state(
-        1, input_spec, constants=constants, training=False,
+    return self._sampler.get_initial_state(
+        1, input_spec, constants={}, training=False,
     )
-    for _ in range(steps):
-      y, state, _ = self._sampler.step_with_emits(
-          x=block, state=state, constants=constants, training=False,
-      )
-      mx.eval(y.values)
 
-    logger.info('Warm-up done (%.1fs).', time.time() - t0)
+  def _compiled_step(self, keys: tuple[str, ...]):
+    """The sampler's frame step under `mx.compile`, for constants `keys`.
+
+    Takes and returns arrays only: the conditioning block's values and mask,
+    the constants in `keys` order, then the flattened state
+    (`flatten_state`). Returns the frame's output values, then the new state,
+    flattened. The block and the constants are inputs, not captured, so new
+    conditioning, temperature or top-k replay the trace.
+    """
+    fn = self._compiled_steps.get(keys)
+    if fn is not None:
+      return fn
+    structure = self._state_structure
+    sampler = self._sampler
+
+    def step(values, mask, *rest):
+      constants = dict(zip(keys, rest[:len(keys)]))
+      state = unflatten_state(list(rest[len(keys):]), structure)
+      out, new_state, _ = sampler.step_with_emits(
+          x=sl.Sequence(values, mask), state=state, constants=constants,
+          training=False,
+      )
+      new_flat, new_structure = flatten_state(new_state)
+      # Runs only while tracing. A state whose structure changed across a
+      # step could not be carried as a flat list.
+      if new_structure != structure:
+        raise RuntimeError(
+            'The sampler state changed structure across a step.'
+        )
+      return [out.values, *new_flat]
+
+    fn = mx.compile(step)
+    self._compiled_steps[keys] = fn
+    return fn
+
+  def _run_frames(self, block, constants, state, frames):
+    """Run `frames` sampler steps from `state`. Returns (samples, state).
+
+    `samples` is an mx.array of [frames * 1920, 2] on the int16 scale.
+
+    Every array in the carried state is evaluated, not just each frame's
+    output. Parts of the state that the output does not need would otherwise
+    stay lazy, and each step's graph would reference the previous one's,
+    keeping its buffers alive: about 120 B per frame, so a stream on a Mac
+    that falls back to MLX's limit of 499 000 Metal buffers ends after about
+    18 000 frames. `mx.eval` does not descend into `sequence_layers`
+    sequences, so the state is flattened first.
+
+    With `compile`, each frame and its state are queued (`mx.async_eval`)
+    before the next frame's call is made, so Python works while the GPU runs.
+    """
+    flat, structure = flatten_state(state)
+    if structure != self._state_structure:
+      raise ValueError(
+          "The state's structure is not this sampler's streaming state."
+      )
+    outputs = []
+    if self.compile:
+      keys = tuple(sorted(constants))
+      fn = self._compiled_step(keys)
+      consts = [constants[k] for k in keys]
+      for _ in range(frames):
+        res = fn(block.values, block.mask, *consts, *flat)
+        out, flat = res[0], res[1:]
+        mx.async_eval(out, flat)
+        outputs.append(out)
+      mx.eval(outputs, flat)
+      state = unflatten_state(list(flat), structure)
+    else:
+      for _ in range(frames):
+        step_output, state, _ = self._sampler.step_with_emits(
+            x=block, state=state, constants=constants, training=False,
+        )
+        flat, _ = flatten_state(state)
+        mx.eval(step_output.values, flat)
+        outputs.append(step_output.values)
+    return mx.concatenate(outputs, axis=1)[0], state
 
   def embed_style(
       self, text_or_audio: str | audio.Waveform,
@@ -389,6 +492,12 @@ class MagentaRT2System:
   ) -> tuple[audio.Waveform, MagentaRT2State]:
     """Generate audio from style conditioning.
 
+    With ``self.compile`` (the default), each frame's sampler step runs
+    compiled and frames are queued ahead; the audio is the same as without
+    it, sample for sample. New conditioning, CFG scales, temperature or top-k
+    reuse the step traced in warm-up. Either way, every array in the
+    returned state is evaluated, so a carried state holds no graph.
+
     Args:
       conditioning: Dictionary mapping TokensConfig.key strings to their values
         Values can be lists of integers (tokens) or raw embeddings (e.g. Style)
@@ -443,23 +552,11 @@ class MagentaRT2System:
 
     # --- Init state if needed ---
     if state is None:
-      init_constants = {}
-      input_spec = sl.ChannelSpec(
-          shape=(self._num_channels,), dtype=mx.int32,
-      )
-      state = self._sampler.get_initial_state(
-          1, input_spec, constants=init_constants, training=False,
-      )
+      state = self._initial_state()
 
     # --- Streaming generation ---
-    results = []
     t0 = time.time()
-    for _ in range(frames):
-      step_output, state, _ = self._sampler.step_with_emits(
-          x=block, state=state, constants=constants, training=False,
-      )
-      mx.eval(step_output.values)
-      results.append(step_output)
+    samples, state = self._run_frames(block, constants, state, frames)
 
     elapsed = time.time() - t0
     ms_per_step = (elapsed / frames) * 1000
@@ -469,7 +566,6 @@ class MagentaRT2System:
     )
 
     # --- Assemble audio ---
-    samples = sl.Sequence.concatenate_sequences(results).values[0]
     samples = np.array(samples)
     # samples shape: [T*1920, 2] (interleaved stereo float32)
     waveform = audio.Waveform(samples.astype(np.float32) / 32768.0, sample_rate=self._sample_rate)
