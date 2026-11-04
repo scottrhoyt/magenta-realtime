@@ -49,6 +49,7 @@ models
 :hidden:
 :caption: Inference
 inference
+prompting
 exporting
 benchmark
 testing
